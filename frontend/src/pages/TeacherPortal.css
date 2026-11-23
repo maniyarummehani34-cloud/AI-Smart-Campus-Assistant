@@ -1,0 +1,73 @@
+/* Teacher Portal Workspace & Marks Entry Styles (Plain CSS) */
+
+.teacher-hero {
+  background: var(--grad-navy);
+  color: var(--white);
+  border-radius: var(--radius-xl);
+  padding: 1.65rem 1.85rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+  box-shadow: var(--shadow-md);
+}
+
+.teacher-hero h2 {
+  font-size: 1.55rem;
+  font-weight: 800;
+  margin-bottom: 0.25rem;
+}
+
+.teacher-hero p {
+  font-size: 0.9rem;
+  color: rgba(226, 238, 255, 0.85);
+}
+
+.marks-input {
+  width: 96px;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-medium);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.marks-input:focus {
+  outline: none;
+  border-color: var(--blue-600);
+}
+
+.remarks-input {
+  width: 100%;
+  min-width: 150px;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-medium);
+  font-size: 0.84rem;
+}
+
+.teacher-feedback-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.8rem 1rem;
+  border-radius: var(--radius-md);
+  margin-bottom: 1.25rem;
+  font-size: 0.88rem;
+  font-weight: 500;
+}
+
+.teacher-feedback-bar.success {
+  background-color: var(--status-success-bg);
+  color: var(--status-success-text);
+  border: 1px solid #b8e8cd;
+}
+
+.teacher-feedback-bar.error {
+  background-color: var(--status-danger-bg);
+  color: var(--status-danger-text);
+  border: 1px solid #f4c7c7;
+}

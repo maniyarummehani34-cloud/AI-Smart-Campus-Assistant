@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="800" y2="450" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#12264f"/>
+      <stop offset="50%" stop-color="#28408a"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="450" fill="url(#bg)"/>
+  <!-- Stage spotlights -->
+  <polygon points="180,0 380,450 20,450" fill="#93c5fd" opacity="0.12"/>
+  <polygon points="400,0 590,450 210,450" fill="#fde68a" opacity="0.12"/>
+  <polygon points="620,0 780,450 420,450" fill="#93c5fd" opacity="0.12"/>
+  <!-- Amphitheater arch & stage -->
+  <path d="M120 350 Q400 130 680 350" stroke="#bfdbfe" stroke-opacity="0.45" stroke-width="6" fill="none"/>
+  <path d="M180 350 Q400 190 620 350" stroke="#fde68a" stroke-opacity="0.45" stroke-width="4" fill="none"/>
+  <ellipse cx="400" cy="365" rx="290" ry="42" fill="#0f2042" stroke="#93c5fd" stroke-opacity="0.35" stroke-width="2"/>
+  <circle cx="400" cy="245" r="36" fill="#fde68a" opacity="0.28"/>
+  <circle cx="400" cy="245" r="18" fill="#fef3c7" opacity="0.65"/>
+</svg>

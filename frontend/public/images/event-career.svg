@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="800" y2="450" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f2443"/>
+      <stop offset="100%" stop-color="#1d5bbf"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="450" fill="url(#bg)"/>
+  <!-- Rising career growth chart & glass atrium -->
+  <rect x="130" y="255" width="74" height="115" rx="8" fill="#93c5fd" opacity="0.3"/>
+  <rect x="240" y="215" width="74" height="155" rx="8" fill="#60a5fa" opacity="0.45"/>
+  <rect x="350" y="170" width="74" height="200" rx="8" fill="#38bdf8" opacity="0.55"/>
+  <rect x="460" y="130" width="74" height="240" rx="8" fill="#93c5fd" opacity="0.7"/>
+  <rect x="570" y="90" width="74" height="280" rx="8" fill="#dbeafe" opacity="0.82"/>
+  <polyline points="167,225 277,185 387,140 497,100 607,62" stroke="#fde68a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="607" cy="62" r="9" fill="#fde68a"/>
+</svg>

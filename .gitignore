@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Environment variables (never commit real secrets)
+.env
+.env.local
+.env.*.local
+
+# Database backups & cloud exports (contain local user records)
+database/backups/
+database/cloud-export/
+
+# SSL/TLS certificates and private keys
+*.pem
+*.crt
+*.key
+
+# Local demo credentials report (never commit or expose)
+docs/demo-local/
+
+# Build outputs
+dist/
+build/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor & OS files
+.vscode/
+.DS_Store
+Thumbs.db

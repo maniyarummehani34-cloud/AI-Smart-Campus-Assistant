@@ -1,0 +1,5 @@
+/* Root App Layout Helpers (Plain CSS) */
+
+#root {
+  min-height: 100vh;
+}
