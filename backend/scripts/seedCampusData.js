@@ -120,12 +120,18 @@ const DEMO_EVENTS = [
 ];
 
 async function seedCampusData() {
-  const conn = await pool.getConnection();
+  let client = null;
+  let inTransaction = false;
+
   try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    inTransaction = true;
+
     console.log('Starting idempotent DEMO/DRAFT campus data seeding...');
 
     // Find an existing admin id (optional creator reference) without modifying any user
-    const [admins] = await conn.query(
+    const { rows: admins } = await client.query(
       "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1"
     );
     const adminId = admins[0]?.id || null;
@@ -133,13 +139,14 @@ async function seedCampusData() {
     // 1. Seed Departments
     const deptMap = new Map();
     for (const d of DEPARTMENTS) {
-      await conn.query(
-        `INSERT IGNORE INTO departments (code, name, description, status)
-         VALUES (?, ?, ?, 'active')`,
+      await client.query(
+        `INSERT INTO departments (code, name, description, status)
+         VALUES ($1, $2, $3, 'active')
+         ON CONFLICT DO NOTHING`,
         [d.code, d.name, d.description]
       );
-      const [rows] = await conn.query(
-        'SELECT id, code, name FROM departments WHERE code = ? LIMIT 1',
+      const { rows } = await client.query(
+        'SELECT id, code, name FROM departments WHERE code = $1 LIMIT 1',
         [d.code]
       );
       deptMap.set(d.name, rows[0]);
@@ -149,14 +156,15 @@ async function seedCampusData() {
     // 2. Seed Faculty (idempotent via unique email)
     const facultyByDept = new Map();
     for (const f of FACULTY_DATA) {
-      await conn.query(
-        `INSERT IGNORE INTO faculty
+      await client.query(
+        `INSERT INTO faculty
            (name, department, designation, email, phone, office_location, consultation_hours, is_demo)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+         ON CONFLICT DO NOTHING`,
         [f.name, f.department, f.designation, f.email, f.phone, f.office, f.hours]
       );
-      const [rows] = await conn.query(
-        'SELECT id, name, department FROM faculty WHERE email = ? LIMIT 1',
+      const { rows } = await client.query(
+        'SELECT id, name, department FROM faculty WHERE email = $1 LIMIT 1',
         [f.email]
       );
       if (!facultyByDept.has(f.department)) facultyByDept.set(f.department, []);
@@ -166,10 +174,11 @@ async function seedCampusData() {
 
     // 3. Seed Facilities (idempotent via unique name)
     for (const fac of FACILITIES_DATA) {
-      await conn.query(
-        `INSERT IGNORE INTO facilities
+      await client.query(
+        `INSERT INTO facilities
            (name, category, description, location, opening_hours, contact_info, status, is_demo)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+         ON CONFLICT DO NOTHING`,
         [fac.name, fac.category, fac.description, fac.location, fac.hours, fac.contact, fac.status]
       );
     }
@@ -188,14 +197,15 @@ async function seedCampusData() {
           const code = `${d.code}${sem}0${idx + 1}`;
           const subjectName =
             idx === 0 ? templates[idx] : `${templates[idx]} (${d.code})`;
-          await conn.query(
-            `INSERT IGNORE INTO subjects
+          await client.query(
+            `INSERT INTO subjects
                (code, name, department_id, department, semester, credits, status, is_demo)
-             VALUES (?, ?, ?, ?, ?, ?, 'draft', 1)`,
+             VALUES ($1, $2, $3, $4, $5, $6, 'draft', TRUE)
+             ON CONFLICT DO NOTHING`,
             [code, subjectName, deptRec.id, d.name, sem, idx === 0 ? 4 : 3]
           );
-          const [sRows] = await conn.query(
-            'SELECT id, code, name FROM subjects WHERE code = ? LIMIT 1',
+          const { rows: sRows } = await client.query(
+            'SELECT id, code, name FROM subjects WHERE code = $1 LIMIT 1',
             [code]
           );
           subjectsByDeptSem.get(key).push(sRows[0]);
@@ -208,15 +218,15 @@ async function seedCampusData() {
     // 5. Seed Notices (DEMO / DRAFT, idempotent by title)
     let noticesInserted = 0;
     for (const n of DEMO_NOTICES) {
-      const [exists] = await conn.query(
-        'SELECT id FROM notices WHERE title = ? LIMIT 1',
+      const { rows: exists } = await client.query(
+        'SELECT id FROM notices WHERE title = $1 LIMIT 1',
         [n.title]
       );
       if (exists.length === 0) {
-        await conn.query(
+        await client.query(
           `INSERT INTO notices
              (title, description, category, target_department, priority, status, is_demo, posted_by, published_date)
-           VALUES (?, ?, ?, ?, ?, 'draft', 1, ?, NOW())`,
+           VALUES ($1, $2, $3, $4, $5, 'draft', TRUE, $6, NOW())`,
           [n.title, n.description, n.category, n.dept, n.priority, adminId]
         );
         noticesInserted += 1;
@@ -227,17 +237,17 @@ async function seedCampusData() {
     // 6. Seed Events across all 11 categories (DEMO / DRAFT, idempotent by title)
     let eventsInserted = 0;
     for (const ev of DEMO_EVENTS) {
-      const [exists] = await conn.query(
-        'SELECT id FROM events WHERE title = ? LIMIT 1',
+      const { rows: exists } = await client.query(
+        'SELECT id FROM events WHERE title = $1 LIMIT 1',
         [ev.title]
       );
       if (exists.length === 0) {
-        await conn.query(
+        await client.query(
           `INSERT INTO events
              (title, description, category, target_department, semester_eligibility,
               event_date, event_time, venue, organizer, registration_details,
               image_url, registration_link, status, is_demo, created_by)
-           VALUES (?, ?, ?, ?, ?, DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, ?, ?, ?, ?, ?, 'draft', 1, ?)`,
+           VALUES ($1, $2, $3, $4, $5, CURRENT_DATE + ($6::int * INTERVAL '1 day'), $7, $8, $9, $10, $11, $12, 'draft', TRUE, $13)`,
           [
             ev.title,
             ev.description,
@@ -278,18 +288,19 @@ async function seedCampusData() {
           const room = `${d.code}-${sem}0${sIdx + 1}`;
           const fac = deptFaculty[sIdx % deptFaculty.length];
 
-          const [exists] = await conn.query(
+          const { rows: exists } = await client.query(
             `SELECT id FROM timetable
-             WHERE department = ? AND semester = ? AND section = 'A' AND day_of_week = ? AND start_time = ?
+             WHERE department = $1 AND semester = $2 AND section = 'A' AND day_of_week = $3 AND start_time = $4
              LIMIT 1`,
             [d.name, sem, day, startTime]
           );
           if (exists.length === 0) {
+            await client.query('SAVEPOINT sp_timetable_slot');
             try {
-              await conn.query(
+              await client.query(
                 `INSERT INTO timetable
                    (department, semester, section, subject, faculty_id, day_of_week, start_time, end_time, classroom, status, is_demo)
-                 VALUES (?, ?, 'A', ?, ?, ?, ?, ?, ?, 'draft', 1)`,
+                 VALUES ($1, $2, 'A', $3, $4, $5, $6, $7, $8, 'draft', TRUE)`,
                 [
                   d.name,
                   sem,
@@ -301,9 +312,12 @@ async function seedCampusData() {
                   room,
                 ]
               );
+              await client.query('RELEASE SAVEPOINT sp_timetable_slot');
               timetableInserted += 1;
             } catch (err) {
-              if (err.sqlState !== '45000' && err.code !== 'ER_DUP_ENTRY') {
+              await client.query('ROLLBACK TO SAVEPOINT sp_timetable_slot');
+              await client.query('RELEASE SAVEPOINT sp_timetable_slot');
+              if (err.code !== 'P0001' && err.code !== '23505') {
                 throw err;
               }
             }
@@ -319,17 +333,18 @@ async function seedCampusData() {
     for (const d of DEPARTMENTS) {
       for (let sem = 1; sem <= 8; sem += 1) {
         const examTitle = `[DEMO] ${d.code} Semester ${sem} Internal Assessment 1`;
-        const [existingExam] = await conn.query(
-          'SELECT id FROM exams WHERE title = ? AND department = ? AND semester = ? AND section = ? LIMIT 1',
+        const { rows: existingExam } = await client.query(
+          'SELECT id FROM exams WHERE title = $1 AND department = $2 AND semester = $3 AND section = $4 LIMIT 1',
           [examTitle, d.name, sem, 'A']
         );
 
         let examId;
         if (existingExam.length === 0) {
-          const [exRes] = await conn.query(
+          const { rows: exRows } = await client.query(
             `INSERT INTO exams
                (title, exam_type, department, semester, section, academic_year, instructions, status, is_demo, created_by)
-             VALUES (?, 'internal_1', ?, ?, 'A', '2026-27', ?, 'draft', 1, ?)`,
+             VALUES ($1, 'internal_1', $2, $3, 'A', '2026-27', $4, 'draft', TRUE, $5)
+             RETURNING id`,
             [
               examTitle,
               d.name,
@@ -338,7 +353,7 @@ async function seedCampusData() {
               adminId,
             ]
           );
-          examId = exRes.insertId;
+          examId = exRows[0].id;
           examsInserted += 1;
         } else {
           examId = existingExam[0].id;
@@ -346,21 +361,32 @@ async function seedCampusData() {
 
         const subjs = subjectsByDeptSem.get(`${d.name}|${sem}`) || [];
         for (let idx = 0; idx < subjs.length; idx += 1) {
-          await conn.query(
-            `INSERT IGNORE INTO exam_subjects
+          await client.query(
+            `INSERT INTO exam_subjects
                (exam_id, subject_id, exam_date, start_time, end_time, max_marks, passing_marks, room, instructions, status)
-             VALUES (?, ?, DATE_ADD(CURDATE(), INTERVAL ? DAY), '10:00:00', '11:30:00', 50.00, 20.00, ?, 'Bring student ID card.', 'draft')`,
+             VALUES ($1, $2, CURRENT_DATE + ($3::int * INTERVAL '1 day'), '10:00:00', '11:30:00', 50.00, 20.00, $4, 'Bring student ID card.', 'draft')
+             ON CONFLICT DO NOTHING`,
             [examId, subjs[idx].id, 14 + idx * 2, `${d.code}-Hall-${sem}`]
           );
         }
       }
     }
+
+    await client.query('COMMIT');
+    inTransaction = false;
+
     console.log(`Exam schedules seeded (DEMO/DRAFT, newly inserted): ${examsInserted}`);
     console.log(
       'Done! All generated content is marked DEMO/DRAFT and hidden from students until approved & published by an Admin.'
     );
+  } catch (err) {
+    if (inTransaction && client) {
+      await client.query('ROLLBACK').catch(() => {});
+      inTransaction = false;
+    }
+    throw err;
   } finally {
-    conn.release();
+    if (client) client.release();
     await pool.end();
   }
 }

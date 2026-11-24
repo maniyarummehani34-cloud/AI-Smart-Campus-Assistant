@@ -81,7 +81,7 @@ async function run() {
   if (!name || !email || !password) {
     console.log('\n=== Smart Campus Assistant: Secure Admin Account Setup ===');
     console.log(
-      'No credentials are hardcoded. Enter details below for your local MySQL database.\n'
+      'No credentials are hardcoded. Enter details below for your local PostgreSQL database.\n'
     );
 
     const rl = readline.createInterface({
@@ -118,8 +118,8 @@ async function run() {
   }
 
   try {
-    const [existing] = await pool.query(
-      'SELECT id, role FROM users WHERE email = ? LIMIT 1',
+    const { rows: existing } = await pool.query(
+      'SELECT id, role FROM users WHERE email = $1 LIMIT 1',
       [email]
     );
 
@@ -132,18 +132,23 @@ async function run() {
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
-    const [result] = await pool.query(
+    const { rows: insertedRows } = await pool.query(
       `INSERT INTO users (name, email, password_hash, role, student_id, department, semester, status)
-       VALUES (?, ?, ?, 'admin', NULL, NULL, NULL, 'active')`,
+       VALUES ($1, $2, $3, 'admin', NULL, NULL, NULL, 'active')
+       RETURNING id`,
       [name, email, passwordHash]
     );
 
     console.log('\nAdmin account created successfully!');
-    console.log(`  ID:    ${result.insertId}`);
+    console.log(`  ID:    ${insertedRows[0].id}`);
     console.log(`  Name:  ${name}`);
     console.log(`  Email: ${email}`);
     console.log('  Role:  admin\n');
   } catch (error) {
+    if (error && error.code === '23505') {
+      console.error(`Error: An account with email "${email}" already exists.`);
+      process.exit(1);
+    }
     console.error(
       `Failed to create admin account (${error && error.code ? error.code : 'UNKNOWN'})`
     );

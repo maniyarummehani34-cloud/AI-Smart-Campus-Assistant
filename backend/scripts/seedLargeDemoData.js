@@ -203,19 +203,29 @@ function buildDemoEvents(departments) {
   return events;
 }
 
-async function batchInsertIgnore(conn, table, columns, rows, chunkSize = 400) {
+async function batchInsertIgnore(client, table, columns, rows, chunkSize = 400) {
   let inserted = 0;
-  for (let i = 0; i < rows.length; i += chunkSize) {
-    const chunk = rows.slice(i, i + chunkSize);
-    const placeholders = chunk
-      .map(() => `(${columns.map(() => '?').join(', ')})`)
-      .join(', ');
-    const flatValues = chunk.flat();
-    const [res] = await conn.query(
-      `INSERT IGNORE INTO ${table} (${columns.join(', ')}) VALUES ${placeholders}`,
+  const safeChunkSize = Math.max(
+    1,
+    Math.min(chunkSize, Math.floor(60000 / columns.length))
+  );
+  for (let i = 0; i < rows.length; i += safeChunkSize) {
+    const chunk = rows.slice(i, i + safeChunkSize);
+    const flatValues = [];
+    const valueTuples = [];
+    for (const row of chunk) {
+      const placeholders = [];
+      for (const val of row) {
+        flatValues.push(val);
+        placeholders.push(`$${flatValues.length}`);
+      }
+      valueTuples.push(`(${placeholders.join(', ')})`);
+    }
+    const res = await client.query(
+      `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${valueTuples.join(', ')} ON CONFLICT DO NOTHING`,
       flatValues
     );
-    inserted += res.affectedRows || 0;
+    inserted += res.rowCount || 0;
   }
   return inserted;
 }
@@ -258,20 +268,22 @@ async function run() {
   const teacherCredentials = [];
   const studentCredentials = [];
 
-  const conn = await pool.getConnection();
+  let client = null;
+  let inTransaction = false;
 
   try {
+    client = await pool.connect();
     console.log('=== Starting Large Synthetic DEMO Data Generation ===');
 
     // 1. Inspect configured departments & existing admin reference (never alter real users)
-    const [departments] = await conn.query(
+    const { rows: departments } = await client.query(
       "SELECT id, code, name FROM departments WHERE status = 'active' ORDER BY id ASC"
     );
     if (departments.length === 0) {
       throw new Error('No active departments found. Run seed-demo first.');
     }
 
-    const [sectionRows] = await conn.query(
+    const { rows: sectionRows } = await client.query(
       `SELECT DISTINCT UPPER(TRIM(section)) AS section FROM (
          SELECT section FROM users WHERE section IS NOT NULL AND section <> ''
          UNION SELECT section FROM timetable WHERE section IS NOT NULL AND section <> ''
@@ -280,7 +292,7 @@ async function run() {
     );
     const sections = sectionRows.length > 0 ? sectionRows.map((r) => r.section) : ['A'];
 
-    const [admins] = await conn.query(
+    const { rows: admins } = await client.query(
       "SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1"
     );
     const adminId = admins[0]?.id || null;
@@ -315,29 +327,49 @@ async function run() {
     // ------------------------------------------------------------------------
     // PHASE A: Publish existing DEMO/DRAFT academic records so demo flows work
     // ------------------------------------------------------------------------
-    await conn.beginTransaction();
+    await client.query('BEGIN');
+    inTransaction = true;
     try {
-      const [u1] = await conn.query("UPDATE subjects SET status = 'published' WHERE is_demo = 1 AND status = 'draft'");
-      const [u2] = await conn.query("UPDATE notices SET status = 'published' WHERE is_demo = 1 AND status = 'draft'");
-      const [u3] = await conn.query("UPDATE events SET status = 'published' WHERE is_demo = 1 AND status = 'draft'");
-      const [u4] = await conn.query("UPDATE timetable SET status = 'published' WHERE is_demo = 1 AND status = 'draft'");
-      const [u5] = await conn.query("UPDATE exams SET status = 'published' WHERE is_demo = 1 AND status = 'draft'");
-      const [u6] = await conn.query(
-        `UPDATE exam_subjects es INNER JOIN exams e ON es.exam_id = e.id
-         SET es.status = 'published' WHERE e.is_demo = 1 AND es.status = 'draft'`
+      const u1 = await client.query(
+        "UPDATE subjects SET status = 'published' WHERE is_demo = TRUE AND status = 'draft'"
+      );
+      const u2 = await client.query(
+        "UPDATE notices SET status = 'published' WHERE is_demo = TRUE AND status = 'draft'"
+      );
+      const u3 = await client.query(
+        "UPDATE events SET status = 'published' WHERE is_demo = TRUE AND status = 'draft'"
+      );
+      const u4 = await client.query(
+        "UPDATE timetable SET status = 'published' WHERE is_demo = TRUE AND status = 'draft'"
+      );
+      const u5 = await client.query(
+        "UPDATE exams SET status = 'published' WHERE is_demo = TRUE AND status = 'draft'"
+      );
+      const u6 = await client.query(
+        `UPDATE exam_subjects es
+         SET status = 'published'
+         FROM exams e
+         WHERE es.exam_id = e.id
+           AND e.is_demo = TRUE
+           AND es.status = 'draft'`
       );
       stats.publishedDraftsUpdated =
-        u1.affectedRows + u2.affectedRows + u3.affectedRows + u4.affectedRows + u5.affectedRows + u6.affectedRows;
-      await conn.commit();
+        u1.rowCount + u2.rowCount + u3.rowCount + u4.rowCount + u5.rowCount + u6.rowCount;
+      await client.query('COMMIT');
+      inTransaction = false;
     } catch (e) {
-      await conn.rollback();
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
+      }
       throw e;
     }
 
     // ------------------------------------------------------------------------
     // PHASE B: 60 Synthetic Demo Teachers (10 per department) + Faculty Profiles
     // ------------------------------------------------------------------------
-    await conn.beginTransaction();
+    await client.query('BEGIN');
+    inTransaction = true;
     const demoTeachersByDept = new Map();
     try {
       for (let dIdx = 0; dIdx < departments.length; dIdx += 1) {
@@ -360,32 +392,34 @@ async function run() {
           const consult = t % 2 === 0 ? 'Tue & Thu, 2:00 PM - 4:00 PM' : 'Mon & Wed, 11:00 AM - 1:00 PM';
 
           // 1) Faculty profile
-          const [facRes] = await conn.query(
-            `INSERT IGNORE INTO faculty
+          const facRes = await client.query(
+            `INSERT INTO faculty
                (name, department, designation, email, phone, office_location, consultation_hours, is_demo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+             ON CONFLICT DO NOTHING`,
             [fullName, dept.name, designation.slice(0, 100), email, phone, office, consult]
           );
-          if (facRes.affectedRows > 0) stats.facultyInserted += 1;
+          if (facRes.rowCount > 0) stats.facultyInserted += 1;
 
-          const [facRow] = await conn.query(
-            'SELECT id FROM faculty WHERE email = ? LIMIT 1',
+          const { rows: facRow } = await client.query(
+            'SELECT id FROM faculty WHERE email = $1 LIMIT 1',
             [email]
           );
           const facultyId = facRow[0]?.id || null;
 
           // 2) Teacher user account
-          const [usrRes] = await conn.query(
-            `INSERT IGNORE INTO users
+          const usrRes = await client.query(
+            `INSERT INTO users
                (name, email, password_hash, role, student_id, employee_id, faculty_id, department, semester, section, status)
-             VALUES (?, ?, ?, 'teacher', NULL, ?, ?, ?, NULL, NULL, 'active')`,
+             VALUES ($1, $2, $3, 'teacher', NULL, $4, $5, $6, NULL, NULL, 'active')
+             ON CONFLICT DO NOTHING`,
             [fullName, email, pwdInfo.hash, empId, facultyId, dept.name]
           );
-          if (usrRes.affectedRows > 0) stats.teachersInserted += 1;
+          if (usrRes.rowCount > 0) stats.teachersInserted += 1;
           else stats.teachersSkipped += 1;
 
-          const [usrRow] = await conn.query(
-            'SELECT id, name, email, employee_id, faculty_id FROM users WHERE email = ? LIMIT 1',
+          const { rows: usrRow } = await client.query(
+            'SELECT id, name, email, employee_id, faculty_id FROM users WHERE email = $1 LIMIT 1',
             [email]
           );
           demoTeachersByDept.get(dept.name).push(usrRow[0]);
@@ -402,16 +436,21 @@ async function run() {
           });
         }
       }
-      await conn.commit();
+      await client.query('COMMIT');
+      inTransaction = false;
     } catch (e) {
-      await conn.rollback();
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
+      }
       throw e;
     }
 
     // ------------------------------------------------------------------------
     // PHASE C: 960+ Synthetic Demo Students (20 per dept × sem × section)
     // ------------------------------------------------------------------------
-    await conn.beginTransaction();
+    await client.query('BEGIN');
+    inTransaction = true;
     try {
       const studentRowsToInsert = [];
       let globalIdx = 1;
@@ -459,7 +498,7 @@ async function run() {
       }
 
       const insertedCount = await batchInsertIgnore(
-        conn,
+        client,
         'users',
         [
           'name', 'email', 'password_hash', 'role', 'student_id',
@@ -470,39 +509,45 @@ async function run() {
       );
       stats.studentsInserted = insertedCount;
       stats.studentsSkipped = studentRowsToInsert.length - insertedCount;
-      await conn.commit();
+      await client.query('COMMIT');
+      inTransaction = false;
     } catch (e) {
-      await conn.rollback();
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
+      }
       throw e;
     }
 
     // ------------------------------------------------------------------------
     // PHASE D: Expand Subjects (3 per dept × sem = 144) & Teacher Assignments
     // ------------------------------------------------------------------------
-    await conn.beginTransaction();
+    await client.query('BEGIN');
+    inTransaction = true;
+    const subjectsByDeptSem = new Map();
+    const assignedTeacherByKey = new Map();
     try {
       for (const dept of departments) {
         for (const sem of SEMESTERS) {
           const code = `${dept.code}${sem}03`;
           const name = `${THIRD_SUBJECT_BY_SEM[sem]} (${dept.code})`;
-          const [res] = await conn.query(
-            `INSERT IGNORE INTO subjects
+          const res = await client.query(
+            `INSERT INTO subjects
                (code, name, department_id, department, semester, credits, status, is_demo)
-             VALUES (?, ?, ?, ?, ?, 3, 'published', 1)`,
+             VALUES ($1, $2, $3, $4, $5, 3, 'published', TRUE)
+             ON CONFLICT DO NOTHING`,
             [code, name, dept.id, dept.name, sem]
           );
-          if (res.affectedRows > 0) stats.subjectsInserted += 1;
+          if (res.rowCount > 0) stats.subjectsInserted += 1;
         }
       }
 
       // Load all published subjects per dept & sem
-      const [allSubjects] = await conn.query(
+      const { rows: allSubjects } = await client.query(
         'SELECT id, code, name, department, semester FROM subjects ORDER BY department ASC, semester ASC, code ASC'
       );
 
       const assignmentRows = [];
-      const subjectsByDeptSem = new Map();
-      const assignedTeacherByKey = new Map();
 
       for (const subj of allSubjects) {
         const key = `${subj.department}|${subj.semester}`;
@@ -538,368 +583,392 @@ async function run() {
       }
 
       stats.assignmentsInserted = await batchInsertIgnore(
-        conn,
+        client,
         'teacher_assignments',
         ['teacher_id', 'subject_id', 'department', 'semester', 'section', 'academic_year', 'assigned_by', 'status'],
         assignmentRows,
         200
       );
-      await conn.commit();
+      await client.query('COMMIT');
+      inTransaction = false;
+    } catch (e) {
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
+      }
+      throw e;
+    }
 
-      // ----------------------------------------------------------------------
-      // PHASE E: Conflict-Free Timetables Across Every Configured Class
-      // ----------------------------------------------------------------------
-      const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      const slotTimes = [
-        ['09:00:00', '10:00:00'],
-        ['10:30:00', '11:30:00'],
-        ['13:00:00', '14:00:00'],
-        ['14:30:00', '15:30:00'],
-      ];
+    // ----------------------------------------------------------------------
+    // PHASE E: Conflict-Free Timetables Across Every Configured Class
+    // ----------------------------------------------------------------------
+    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const slotTimes = [
+      ['09:00:00', '10:00:00'],
+      ['10:30:00', '11:30:00'],
+      ['13:00:00', '14:00:00'],
+      ['14:30:00', '15:30:00'],
+    ];
 
+    for (const dept of departments) {
+      for (const sem of SEMESTERS) {
+        const subjs = (subjectsByDeptSem.get(`${dept.name}|${sem}`) || []).slice(0, 3);
+        for (const sec of sections) {
+          for (let sIdx = 0; sIdx < subjs.length; sIdx += 1) {
+            const slotNum = (sem - 1) * 3 + sIdx; // 0..23 unique within dept
+            const day = days[slotNum % 6];
+            const [startT, endT] = slotTimes[Math.floor(slotNum / 6) % 4];
+            const room = `${dept.code}-T${sem}${sec}${sIdx + 1}`;
+            const assignedTeacher = assignedTeacherByKey.get(
+              `${dept.name}|${sem}|${sec}|${subjs[sIdx].id}`
+            );
+
+            try {
+              const tRes = await client.query(
+                `INSERT INTO timetable
+                   (department, semester, section, subject, faculty_id, day_of_week, start_time, end_time, classroom, status, is_demo)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'published', TRUE)`,
+                [
+                  dept.name,
+                  sem,
+                  sec,
+                  subjs[sIdx].name,
+                  assignedTeacher ? assignedTeacher.faculty_id : null,
+                  day,
+                  startT,
+                  endT,
+                  room,
+                ]
+              );
+              if (tRes.rowCount > 0) stats.timetableInserted += 1;
+            } catch (err) {
+              if (err && (err.code === 'P0001' || err.code === '23505')) {
+                stats.timetableSkipped += 1;
+              } else {
+                throw err;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ----------------------------------------------------------------------
+    // PHASE F: Notices (36+ new), Events (33+ new), Extra Facilities
+    // ----------------------------------------------------------------------
+    await client.query('BEGIN');
+    inTransaction = true;
+    try {
+      for (const fac of EXTRA_FACILITIES) {
+        const fRes = await client.query(
+          `INSERT INTO facilities
+             (name, category, description, location, opening_hours, contact_info, status, is_demo)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+           ON CONFLICT DO NOTHING`,
+          [fac.name, fac.category, fac.description, fac.location, fac.hours, fac.contact, fac.status]
+        );
+        if (fRes.rowCount > 0) stats.facilitiesInserted += 1;
+      }
+
+      const demoNotices = buildDemoNotices(departments);
+      for (const n of demoNotices) {
+        const { rows: exists } = await client.query(
+          'SELECT id FROM notices WHERE title = $1 LIMIT 1',
+          [n.title]
+        );
+        if (exists.length === 0) {
+          await client.query(
+            `INSERT INTO notices
+               (title, description, category, target_department, priority, status, is_demo, posted_by, published_date)
+             VALUES ($1, $2, $3, $4, $5, 'published', TRUE, $6, NOW())`,
+            [n.title, n.description, n.category, n.target_department, n.priority, adminId]
+          );
+          stats.noticesInserted += 1;
+        }
+      }
+
+      const demoEvents = buildDemoEvents(departments);
+      for (const ev of demoEvents) {
+        const { rows: exists } = await client.query(
+          'SELECT id FROM events WHERE title = $1 LIMIT 1',
+          [ev.title]
+        );
+        if (exists.length === 0) {
+          await client.query(
+            `INSERT INTO events
+               (title, description, category, target_department, semester_eligibility,
+                event_date, event_time, venue, organizer, registration_details,
+                image_url, registration_link, status, is_demo, created_by)
+             VALUES ($1, $2, $3, $4, $5, CURRENT_DATE + ($6::int * INTERVAL '1 day'), $7, $8, $9, $10, $11, '#demo-register', 'published', TRUE, $12)`,
+            [
+              ev.title,
+              ev.description,
+              ev.category,
+              ev.target_department,
+              ev.semester_eligibility,
+              ev.offsetDays,
+              ev.time,
+              ev.venue,
+              ev.organizer,
+              ev.registration_details,
+              ev.image_url,
+              adminId,
+            ]
+          );
+          stats.eventsInserted += 1;
+        }
+      }
+      await client.query('COMMIT');
+      inTransaction = false;
+    } catch (e) {
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
+      }
+      throw e;
+    }
+
+    // ----------------------------------------------------------------------
+    // PHASE G: Examinations (All 6 Types × All Depts × All Semesters)
+    // ----------------------------------------------------------------------
+    await client.query('BEGIN');
+    inTransaction = true;
+    const examMetaList = [];
+    try {
       for (const dept of departments) {
         for (const sem of SEMESTERS) {
           const subjs = (subjectsByDeptSem.get(`${dept.name}|${sem}`) || []).slice(0, 3);
           for (const sec of sections) {
-            for (let sIdx = 0; sIdx < subjs.length; sIdx += 1) {
-              const slotNum = (sem - 1) * 3 + sIdx; // 0..23 unique within dept
-              const day = days[slotNum % 6];
-              const [startT, endT] = slotTimes[Math.floor(slotNum / 6) % 4];
-              const room = `${dept.code}-T${sem}${sec}${sIdx + 1}`;
-              const assignedTeacher = assignedTeacherByKey.get(
-                `${dept.name}|${sem}|${sec}|${subjs[sIdx].id}`
+            for (const exDef of EXAM_DEFINITIONS) {
+              const title = `[DEMO] ${dept.code} Semester ${sem} ${exDef.label}`;
+              const { rows: existing } = await client.query(
+                `SELECT id FROM exams WHERE title = $1 AND department = $2 AND semester = $3 AND section = $4 LIMIT 1`,
+                [title, dept.name, sem, sec]
               );
 
-              try {
-                const [tRes] = await conn.query(
-                  `INSERT INTO timetable
-                     (department, semester, section, subject, faculty_id, day_of_week, start_time, end_time, classroom, status, is_demo)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', 1)`,
+              let examId;
+              if (existing.length === 0) {
+                const { rows: exRows } = await client.query(
+                  `INSERT INTO exams
+                     (title, exam_type, department, semester, section, academic_year, instructions, status, is_demo, created_by)
+                   VALUES ($1, $2, $3, $4, $5, '2026-27', $6, 'published', TRUE, $7)
+                   RETURNING id`,
                   [
+                    title,
+                    exDef.type,
                     dept.name,
                     sem,
                     sec,
-                    subjs[sIdx].name,
-                    assignedTeacher ? assignedTeacher.faculty_id : null,
-                    day,
-                    startT,
-                    endT,
-                    room,
+                    'DEMO DATA: Synthetic examination schedule generated for portal evaluation.',
+                    adminId,
                   ]
                 );
-                if (tRes.affectedRows > 0) stats.timetableInserted += 1;
-              } catch (err) {
-                if (err.sqlState === '45000' || err.code === 'ER_DUP_ENTRY') {
-                  stats.timetableSkipped += 1;
-                } else {
-                  throw err;
-                }
+                examId = exRows[0].id;
+                stats.examsInserted += 1;
+              } else {
+                examId = existing[0].id;
               }
-            }
-          }
-        }
-      }
 
-      // ----------------------------------------------------------------------
-      // PHASE F: Notices (36+ new), Events (33+ new), Extra Facilities
-      // ----------------------------------------------------------------------
-      await conn.beginTransaction();
-      try {
-        for (const fac of EXTRA_FACILITIES) {
-          const [fRes] = await conn.query(
-            `INSERT IGNORE INTO facilities
-               (name, category, description, location, opening_hours, contact_info, status, is_demo)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
-            [fac.name, fac.category, fac.description, fac.location, fac.hours, fac.contact, fac.status]
-          );
-          if (fRes.affectedRows > 0) stats.facilitiesInserted += 1;
-        }
-
-        const demoNotices = buildDemoNotices(departments);
-        for (const n of demoNotices) {
-          const [exists] = await conn.query('SELECT id FROM notices WHERE title = ? LIMIT 1', [n.title]);
-          if (exists.length === 0) {
-            await conn.query(
-              `INSERT INTO notices
-                 (title, description, category, target_department, priority, status, is_demo, posted_by, published_date)
-               VALUES (?, ?, ?, ?, ?, 'published', 1, ?, NOW())`,
-              [n.title, n.description, n.category, n.target_department, n.priority, adminId]
-            );
-            stats.noticesInserted += 1;
-          }
-        }
-
-        const demoEvents = buildDemoEvents(departments);
-        for (const ev of demoEvents) {
-          const [exists] = await conn.query('SELECT id FROM events WHERE title = ? LIMIT 1', [ev.title]);
-          if (exists.length === 0) {
-            await conn.query(
-              `INSERT INTO events
-                 (title, description, category, target_department, semester_eligibility,
-                  event_date, event_time, venue, organizer, registration_details,
-                  image_url, registration_link, status, is_demo, created_by)
-               VALUES (?, ?, ?, ?, ?, DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, ?, ?, ?, ?, '#demo-register', 'published', 1, ?)`,
-              [
-                ev.title,
-                ev.description,
-                ev.category,
-                ev.target_department,
-                ev.semester_eligibility,
-                ev.offsetDays,
-                ev.time,
-                ev.venue,
-                ev.organizer,
-                ev.registration_details,
-                ev.image_url,
-                adminId,
-              ]
-            );
-            stats.eventsInserted += 1;
-          }
-        }
-        await conn.commit();
-      } catch (e) {
-        await conn.rollback();
-        throw e;
-      }
-
-      // ----------------------------------------------------------------------
-      // PHASE G: Examinations (All 6 Types × All Depts × All Semesters)
-      // ----------------------------------------------------------------------
-      await conn.beginTransaction();
-      const examMetaList = [];
-      try {
-        for (const dept of departments) {
-          for (const sem of SEMESTERS) {
-            const subjs = (subjectsByDeptSem.get(`${dept.name}|${sem}`) || []).slice(0, 3);
-            for (const sec of sections) {
-              for (const exDef of EXAM_DEFINITIONS) {
-                const title = `[DEMO] ${dept.code} Semester ${sem} ${exDef.label}`;
-                const [existing] = await conn.query(
-                  `SELECT id FROM exams WHERE title = ? AND department = ? AND semester = ? AND section = ? LIMIT 1`,
-                  [title, dept.name, sem, sec]
+              const examSubjectEntries = [];
+              for (let sIdx = 0; sIdx < subjs.length; sIdx += 1) {
+                const subj = subjs[sIdx];
+                const esRes = await client.query(
+                  `INSERT INTO exam_subjects
+                     (exam_id, subject_id, exam_date, start_time, end_time, max_marks, passing_marks, room, instructions, status)
+                   VALUES ($1, $2, CURRENT_DATE + ($3::int * INTERVAL '1 day'), $4, $5, $6, $7, $8, 'DEMO DATA: Carry ID card.', 'published')
+                   ON CONFLICT DO NOTHING`,
+                  [
+                    examId,
+                    subj.id,
+                    exDef.offsetDays + sIdx,
+                    exDef.start,
+                    exDef.end,
+                    exDef.maxMarks,
+                    exDef.passMarks,
+                    `${dept.code}-ExamHall-${sem}`,
+                  ]
                 );
+                if (esRes.rowCount > 0) stats.examSubjectsInserted += 1;
 
-                let examId;
-                if (existing.length === 0) {
-                  const [exRes] = await conn.query(
-                    `INSERT INTO exams
-                       (title, exam_type, department, semester, section, academic_year, instructions, status, is_demo, created_by)
-                     VALUES (?, ?, ?, ?, ?, '2026-27', ?, 'published', 1, ?)`,
-                    [
-                      title,
-                      exDef.type,
-                      dept.name,
-                      sem,
-                      sec,
-                      'DEMO DATA: Synthetic examination schedule generated for portal evaluation.',
-                      adminId,
-                    ]
-                  );
-                  examId = exRes.insertId;
-                  stats.examsInserted += 1;
-                } else {
-                  examId = existing[0].id;
+                const { rows: esRow } = await client.query(
+                  'SELECT id, subject_id, max_marks, passing_marks FROM exam_subjects WHERE exam_id = $1 AND subject_id = $2 LIMIT 1',
+                  [examId, subj.id]
+                );
+                if (esRow[0]) {
+                  examSubjectEntries.push({
+                    ...esRow[0],
+                    teacher: assignedTeacherByKey.get(`${dept.name}|${sem}|${sec}|${subj.id}`),
+                  });
                 }
-
-                const examSubjectEntries = [];
-                for (let sIdx = 0; sIdx < subjs.length; sIdx += 1) {
-                  const subj = subjs[sIdx];
-                  const [esRes] = await conn.query(
-                    `INSERT IGNORE INTO exam_subjects
-                       (exam_id, subject_id, exam_date, start_time, end_time, max_marks, passing_marks, room, instructions, status)
-                     VALUES (?, ?, DATE_ADD(CURDATE(), INTERVAL ? DAY), ?, ?, ?, ?, ?, 'DEMO DATA: Carry ID card.', 'published')`,
-                    [
-                      examId,
-                      subj.id,
-                      exDef.offsetDays + sIdx,
-                      exDef.start,
-                      exDef.end,
-                      exDef.maxMarks,
-                      exDef.passMarks,
-                      `${dept.code}-ExamHall-${sem}`,
-                    ]
-                  );
-                  if (esRes.affectedRows > 0) stats.examSubjectsInserted += 1;
-
-                  const [esRow] = await conn.query(
-                    'SELECT id, subject_id, max_marks, passing_marks FROM exam_subjects WHERE exam_id = ? AND subject_id = ? LIMIT 1',
-                    [examId, subj.id]
-                  );
-                  if (esRow[0]) {
-                    examSubjectEntries.push({
-                      ...esRow[0],
-                      teacher: assignedTeacherByKey.get(`${dept.name}|${sem}|${sec}|${subj.id}`),
-                    });
-                  }
-                }
-
-                examMetaList.push({
-                  examId,
-                  examType: exDef.type,
-                  department: dept.name,
-                  semester: sem,
-                  section: sec,
-                  subjects: examSubjectEntries,
-                });
               }
+
+              examMetaList.push({
+                examId,
+                examType: exDef.type,
+                department: dept.name,
+                semester: sem,
+                section: sec,
+                subjects: examSubjectEntries,
+              });
             }
           }
         }
-        await conn.commit();
-      } catch (e) {
-        await conn.rollback();
-        throw e;
       }
+      await client.query('COMMIT');
+      inTransaction = false;
+    } catch (e) {
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
+      }
+      throw e;
+    }
 
-      // ----------------------------------------------------------------------
-      // PHASE H: Synthetic Marks & Results (STRICTLY FOR DEMO STUDENTS ONLY!)
-      // Never generates fake marks for real student accounts!
-      // ----------------------------------------------------------------------
-      console.log('Generating realistic synthetic marks & results for DEMO students only...');
-      const [demoStudents] = await conn.query(
-        `SELECT id, student_id, department, semester, COALESCE(section, 'A') AS section
-         FROM users
-         WHERE role = 'student'
-           AND email LIKE 'student.%@smartcampus.demo'
-           AND student_id LIKE 'DEMO-%'
-         ORDER BY id ASC`
+    // ----------------------------------------------------------------------
+    // PHASE H: Synthetic Marks & Results (STRICTLY FOR DEMO STUDENTS ONLY!)
+    // Never generates fake marks for real student accounts!
+    // ----------------------------------------------------------------------
+    console.log('Generating realistic synthetic marks & results for DEMO students only...');
+    const { rows: demoStudents } = await client.query(
+      `SELECT id, student_id, department, semester, COALESCE(section, 'A') AS section
+       FROM users
+       WHERE role = 'student'
+         AND email LIKE 'student.%@smartcampus.demo'
+         AND student_id LIKE 'DEMO-%'
+       ORDER BY id ASC`
+    );
+
+    const studentsByClass = new Map();
+    for (const st of demoStudents) {
+      const key = `${st.department}|${st.semester}|${st.section}`;
+      if (!studentsByClass.has(key)) studentsByClass.set(key, []);
+      studentsByClass.get(key).push(st);
+    }
+
+    const markRows = [];
+    const resultRows = [];
+
+    for (const ex of examMetaList) {
+      const classStudents =
+        studentsByClass.get(`${ex.department}|${ex.semester}|${ex.section}`) || [];
+
+      // Keep Sem 5 internal_2 marks in 'submitted' state so Admin sees real pending approvals!
+      const leavePendingApproval =
+        ex.semester === 5 && ex.examType === 'internal_2';
+
+      for (let stIdx = 0; stIdx < classStudents.length; stIdx += 1) {
+        const st = classStudents[stIdx];
+
+        // Realistic varied performance bands across the 20 students in each class:
+        // 0..3 High (84%-97%), 4..13 Average (60%-82%), 14..16 Borderline Pass (44%-58%), 17..19 Low/Fail (20%-38%)
+        let bandMin = 60;
+        let bandMax = 82;
+        let remark = 'DEMO DATA — Consistent academic progress';
+        if (stIdx < 4) {
+          bandMin = 84;
+          bandMax = 97;
+          remark = 'DEMO DATA — Outstanding academic performance';
+        } else if (stIdx >= 14 && stIdx <= 16) {
+          bandMin = 44;
+          bandMax = 58;
+          remark = 'DEMO DATA — Satisfactory; scope to improve';
+        } else if (stIdx >= 17) {
+          bandMin = 20;
+          bandMax = 38;
+          remark = 'DEMO DATA — Below passing threshold; academic support advised';
+        }
+
+        const studentSubjectMarks = [];
+
+        for (let subIdx = 0; subIdx < ex.subjects.length; subIdx += 1) {
+          const es = ex.subjects[subIdx];
+          const maxM = Number(es.max_marks);
+          const passM = Number(es.passing_marks);
+
+          const r = deterministicRand(st.id * 31 + es.id * 17 + subIdx * 7);
+          const pct = bandMin + r * (bandMax - bandMin);
+          let obtained = Math.round(((pct / 100) * maxM) * 2) / 2;
+          obtained = Math.max(0, Math.min(maxM, obtained));
+
+          const submissionStatus = leavePendingApproval ? 'submitted' : 'approved';
+          const enteredBy = es.teacher ? es.teacher.id : adminId;
+          const reviewedBy = leavePendingApproval ? null : adminId;
+          const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+          markRows.push([
+            es.id,
+            st.id,
+            es.subject_id,
+            enteredBy,
+            obtained,
+            maxM,
+            remark,
+            submissionStatus,
+            nowStr,
+            reviewedBy,
+            leavePendingApproval ? null : nowStr,
+            leavePendingApproval ? null : 'DEMO DATA — Verified for demo publication',
+          ]);
+
+          studentSubjectMarks.push({
+            obtained_marks: obtained,
+            max_marks: maxM,
+            passing_marks: passM,
+          });
+        }
+
+        // Publish verified results for approved demo exams using configurable gradingRules.js
+        if (!leavePendingApproval && studentSubjectMarks.length > 0) {
+          const calc = calculateExamResult(studentSubjectMarks);
+          const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+          resultRows.push([
+            ex.examId,
+            st.id,
+            calc.totalObtained,
+            calc.totalMax,
+            calc.percentage,
+            calc.grade,
+            calc.passStatus,
+            'published',
+            adminId,
+            nowStr,
+          ]);
+        }
+      }
+    }
+
+    await client.query('BEGIN');
+    inTransaction = true;
+    try {
+      stats.marksInserted = await batchInsertIgnore(
+        client,
+        'marks',
+        [
+          'exam_subject_id', 'student_id', 'subject_id', 'entered_by',
+          'obtained_marks', 'max_marks', 'remarks', 'submission_status',
+          'submitted_at', 'reviewed_by', 'reviewed_at', 'review_notes',
+        ],
+        markRows,
+        500
       );
 
-      const studentsByClass = new Map();
-      for (const st of demoStudents) {
-        const key = `${st.department}|${st.semester}|${st.section}`;
-        if (!studentsByClass.has(key)) studentsByClass.set(key, []);
-        studentsByClass.get(key).push(st);
-      }
-
-      const markRows = [];
-      const resultRows = [];
-
-      for (const ex of examMetaList) {
-        const classStudents =
-          studentsByClass.get(`${ex.department}|${ex.semester}|${ex.section}`) || [];
-
-        // Keep Sem 5 internal_2 marks in 'submitted' state so Admin sees real pending approvals!
-        const leavePendingApproval =
-          ex.semester === 5 && ex.examType === 'internal_2';
-
-        for (let stIdx = 0; stIdx < classStudents.length; stIdx += 1) {
-          const st = classStudents[stIdx];
-
-          // Realistic varied performance bands across the 20 students in each class:
-          // 0..3 High (84%-97%), 4..13 Average (60%-82%), 14..16 Borderline Pass (44%-58%), 17..19 Low/Fail (20%-38%)
-          let bandMin = 60;
-          let bandMax = 82;
-          let remark = 'DEMO DATA — Consistent academic progress';
-          if (stIdx < 4) {
-            bandMin = 84;
-            bandMax = 97;
-            remark = 'DEMO DATA — Outstanding academic performance';
-          } else if (stIdx >= 14 && stIdx <= 16) {
-            bandMin = 44;
-            bandMax = 58;
-            remark = 'DEMO DATA — Satisfactory; scope to improve';
-          } else if (stIdx >= 17) {
-            bandMin = 20;
-            bandMax = 38;
-            remark = 'DEMO DATA — Below passing threshold; academic support advised';
-          }
-
-          const studentSubjectMarks = [];
-
-          for (let subIdx = 0; subIdx < ex.subjects.length; subIdx += 1) {
-            const es = ex.subjects[subIdx];
-            const maxM = Number(es.max_marks);
-            const passM = Number(es.passing_marks);
-
-            const r = deterministicRand(st.id * 31 + es.id * 17 + subIdx * 7);
-            const pct = bandMin + r * (bandMax - bandMin);
-            let obtained = Math.round(((pct / 100) * maxM) * 2) / 2;
-            obtained = Math.max(0, Math.min(maxM, obtained));
-
-            const submissionStatus = leavePendingApproval ? 'submitted' : 'approved';
-            const enteredBy = es.teacher ? es.teacher.id : adminId;
-            const reviewedBy = leavePendingApproval ? null : adminId;
-            const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-            markRows.push([
-              es.id,
-              st.id,
-              es.subject_id,
-              enteredBy,
-              obtained,
-              maxM,
-              remark,
-              submissionStatus,
-              nowStr,
-              reviewedBy,
-              leavePendingApproval ? null : nowStr,
-              leavePendingApproval ? null : 'DEMO DATA — Verified for demo publication',
-            ]);
-
-            studentSubjectMarks.push({
-              obtained_marks: obtained,
-              max_marks: maxM,
-              passing_marks: passM,
-            });
-          }
-
-          // Publish verified results for approved demo exams using configurable gradingRules.js
-          if (!leavePendingApproval && studentSubjectMarks.length > 0) {
-            const calc = calculateExamResult(studentSubjectMarks);
-            const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
-            resultRows.push([
-              ex.examId,
-              st.id,
-              calc.totalObtained,
-              calc.totalMax,
-              calc.percentage,
-              calc.grade,
-              calc.passStatus,
-              'published',
-              adminId,
-              nowStr,
-            ]);
-          }
-        }
-      }
-
-      await conn.beginTransaction();
-      try {
-        stats.marksInserted = await batchInsertIgnore(
-          conn,
-          'marks',
-          [
-            'exam_subject_id', 'student_id', 'subject_id', 'entered_by',
-            'obtained_marks', 'max_marks', 'remarks', 'submission_status',
-            'submitted_at', 'reviewed_by', 'reviewed_at', 'review_notes',
-          ],
-          markRows,
-          500
-        );
-
-        stats.resultsInserted = await batchInsertIgnore(
-          conn,
-          'results',
-          [
-            'exam_id', 'student_id', 'total_obtained', 'total_max',
-            'percentage', 'grade', 'pass_status', 'publish_status',
-            'published_by', 'published_at',
-          ],
-          resultRows,
-          500
-        );
-        await conn.commit();
-      } catch (e) {
-        await conn.rollback();
-        throw e;
-      }
+      stats.resultsInserted = await batchInsertIgnore(
+        client,
+        'results',
+        [
+          'exam_id', 'student_id', 'total_obtained', 'total_max',
+          'percentage', 'grade', 'pass_status', 'publish_status',
+          'published_by', 'published_at',
+        ],
+        resultRows,
+        500
+      );
+      await client.query('COMMIT');
+      inTransaction = false;
     } catch (e) {
-      try {
-        await conn.rollback();
-      } catch {
-        // ignore if already rolled back
+      if (inTransaction) {
+        await client.query('ROLLBACK').catch(() => {});
+        inTransaction = false;
       }
       throw e;
     }
@@ -938,7 +1007,7 @@ async function run() {
 
     const credsMd = `# LOCAL DEMONSTRATION ONLY — Synthetic Demo Login Credentials
 
-> **SECURITY NOTICE:** These accounts are synthetic demo credentials for **local project evaluation only**. This folder (\`docs/demo-local/\`) is gitignored and never served by the backend or frontend. Passwords in MySQL are stored strictly as cost-12 bcrypt hashes.
+> **SECURITY NOTICE:** These accounts are synthetic demo credentials for **local project evaluation only**. This folder (\`docs/demo-local/\`) is gitignored and never served by the backend or frontend. Passwords in PostgreSQL are stored strictly as cost-12 bcrypt hashes.
 
 ## Documented Demo Password Policy
 * **Demo Teachers:** \`${teacherPassPrefix}<DEPT_CODE>2026\`
@@ -964,18 +1033,18 @@ ${sampleStudentsMd}
       'timetable', 'notices', 'events', 'facilities', 'exams', 'exam_subjects',
       'marks', 'results',
     ]) {
-      const [cnt] = await conn.query(`SELECT COUNT(*) AS c FROM ${tbl}`);
+      const { rows: cnt } = await client.query(`SELECT COUNT(*)::int AS c FROM ${tbl}`);
       tableTotals[tbl] = Number(cnt[0].c);
     }
 
-    const [roleTotals] = await conn.query(
-      'SELECT role, COUNT(*) AS c FROM users GROUP BY role ORDER BY role'
+    const { rows: roleTotals } = await client.query(
+      'SELECT role, COUNT(*)::int AS c FROM users GROUP BY role ORDER BY role'
     );
 
     const summaryMd = `# Synthetic Demo Data Seeding Summary
 
 Generated at: ${new Date().toISOString()}
-Database: \`campus_assistant_db_v2\`
+Database: \`${process.env.PG_DATABASE || 'campus_assistant_pg'}\`
 
 ## Records Inserted / Skipped During Latest Run
 | Category | Inserted | Skipped / Existing |
@@ -1009,8 +1078,14 @@ ${roleTotals.map((r) => `- **${r.role}**: ${r.c}`).join('\n')}
     console.log(`\n=== Seeding Complete in ${elapsedSec}s ===`);
     console.log(JSON.stringify({ stats, tableTotals, roleTotals }, null, 2));
     console.log('Local reports saved in: docs/demo-local/ (gitignored)');
+  } catch (e) {
+    if (inTransaction && client) {
+      await client.query('ROLLBACK').catch(() => {});
+      inTransaction = false;
+    }
+    throw e;
   } finally {
-    conn.release();
+    if (client) client.release();
     await pool.end();
   }
 }

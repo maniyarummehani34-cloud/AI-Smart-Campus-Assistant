@@ -40,13 +40,13 @@ async function authenticateToken(req, res, next) {
       });
     }
 
-    // Fetch fresh user profile from MySQL without password_hash
-    const [rows] = await pool.query(
+    // Fetch fresh user profile from PostgreSQL without password_hash
+    const { rows } = await pool.query(
       `SELECT
          id, name, email, role, student_id, employee_id, faculty_id,
          department, semester, section, status, created_at
        FROM users
-       WHERE id = ?
+       WHERE id = $1
        LIMIT 1`,
       [decoded.id]
     );

@@ -1,10 +1,9 @@
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api';
+import { getApiBaseUrl } from '../config/apiConfig';
 
 async function teacherRequest(endpoint, token, { method = 'GET', body } = {}) {
   let response;
   try {
-    response = await fetch(`${API_BASE_URL}/teacher${endpoint}`, {
+    response = await fetch(`${getApiBaseUrl()}/teacher${endpoint}`, {
       method,
       headers: {
         'Content-Type': 'application/json',

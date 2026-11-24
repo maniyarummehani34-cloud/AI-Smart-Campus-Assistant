@@ -1,6 +1,8 @@
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 
 // Load environment variables from backend/.env in local dev
@@ -17,13 +19,27 @@ const PORT = process.env.PORT || 5000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 // Support single or comma-separated allowed frontend origins (trimming trailing slashes)
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
+const allowedOrigins = (
+  process.env.FRONTEND_URL || (IS_PRODUCTION ? '' : 'http://localhost:5173')
+)
   .split(',')
   .map((url) => url.trim().replace(/\/+$/, ''))
   .filter(Boolean);
 
-// Middleware
+if (IS_PRODUCTION && allowedOrigins.length === 0) {
+  console.warn(
+    'CORS warning: FRONTEND_URL is not set in production. Browser requests from external origins will be rejected.'
+  );
+}
+
+// Security middleware
+app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
 app.use(
   cors({
     origin(origin, callback) {
@@ -40,6 +56,33 @@ app.use(
   })
 );
 app.use(express.json({ limit: '1mb' }));
+
+// Rate limiting (protects the laptop Express backend behind a public HTTPS tunnel)
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.API_RATE_LIMIT_MAX) || 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health',
+  message: {
+    message: 'Too many requests. Please wait a few minutes and try again.',
+  },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.AUTH_RATE_LIMIT_MAX) || 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message:
+      'Too many authentication attempts. Please wait 15 minutes and try again.',
+  },
+});
+
+app.use('/api', apiLimiter);
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 // Basic root route
 app.get('/', (req, res) => {
@@ -87,7 +130,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// MySQL database health check endpoint
+// PostgreSQL database health check endpoint
 app.get('/api/db-health', async (req, res) => {
   try {
     const isConnected = await checkDatabaseHealth();
@@ -104,7 +147,7 @@ app.get('/api/db-health', async (req, res) => {
     return res.status(200).json({
       status: 'ok',
       database: 'connected',
-      message: 'MySQL database connection is healthy.',
+      message: 'PostgreSQL database connection is healthy.',
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -114,18 +157,18 @@ app.get('/api/db-health', async (req, res) => {
 
     let safeMessage = IS_PRODUCTION
       ? 'Database service is currently unavailable. Please try again later.'
-      : 'Unable to connect to MySQL. Please verify your database service and backend/.env.';
+      : 'Unable to connect to PostgreSQL. Please verify your database service and backend/.env.';
 
     if (!IS_PRODUCTION) {
-      if (errorCode === 'ER_ACCESS_DENIED_ERROR') {
+      if (errorCode === '28P01') {
         safeMessage =
-          'Database authentication failed. Please verify DB_USER and DB_PASSWORD in backend/.env.';
+          'Database authentication failed. Please verify PG_USER and PG_PASSWORD in backend/.env.';
       } else if (errorCode === 'ECONNREFUSED') {
         safeMessage =
-          'Could not reach the MySQL server. Make sure MySQL is started in XAMPP.';
-      } else if (errorCode === 'ER_BAD_DB_ERROR') {
+          'Could not reach the PostgreSQL server. Make sure PostgreSQL is running.';
+      } else if (errorCode === '3D000') {
         safeMessage =
-          'Target database was not found. Please verify DB_NAME in backend/.env.';
+          'Target database was not found. Please verify PG_DATABASE in backend/.env.';
       }
     }
 

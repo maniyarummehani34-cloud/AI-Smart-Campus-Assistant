@@ -128,8 +128,8 @@ async function registerStudent(req, res) {
       });
     }
 
-    const [existingEmail] = await pool.query(
-      'SELECT id FROM users WHERE email = ? LIMIT 1',
+    const { rows: existingEmail } = await pool.query(
+      'SELECT id FROM users WHERE email = $1 LIMIT 1',
       [cleanEmail]
     );
     if (existingEmail.length > 0) {
@@ -138,8 +138,8 @@ async function registerStudent(req, res) {
       });
     }
 
-    const [existingStudentId] = await pool.query(
-      'SELECT id FROM users WHERE student_id = ? LIMIT 1',
+    const { rows: existingStudentId } = await pool.query(
+      'SELECT id FROM users WHERE student_id = $1 LIMIT 1',
       [cleanStudentId]
     );
     if (existingStudentId.length > 0) {
@@ -150,9 +150,10 @@ async function registerStudent(req, res) {
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
 
-    const [result] = await pool.query(
+    const { rows: insertedRows } = await pool.query(
       `INSERT INTO users (name, email, password_hash, role, student_id, department, semester, section, status)
-       VALUES (?, ?, ?, 'student', ?, ?, ?, ?, 'active')`,
+       VALUES ($1, $2, $3, 'student', $4, $5, $6, $7, 'active')
+       RETURNING id`,
       [
         cleanName,
         cleanEmail,
@@ -164,12 +165,12 @@ async function registerStudent(req, res) {
       ]
     );
 
-    const [createdRows] = await pool.query(
+    const { rows: createdRows } = await pool.query(
       `SELECT id, name, email, role, student_id, employee_id, faculty_id, department, semester, section, status, created_at
        FROM users
-       WHERE id = ?
+       WHERE id = $1
        LIMIT 1`,
-      [result.insertId]
+      [insertedRows[0].id]
     );
 
     const user = sanitizeUser(createdRows[0]);
@@ -181,7 +182,7 @@ async function registerStudent(req, res) {
       user,
     });
   } catch (error) {
-    if (error && error.code === 'ER_DUP_ENTRY') {
+    if (error && error.code === '23505') {
       return res.status(409).json({
         message: 'An account with this email or Student ID already exists.',
       });
@@ -198,7 +199,7 @@ async function registerStudent(req, res) {
 
 /**
  * POST /api/auth/login
- * Authenticates Student, Teacher, and Admin accounts using MySQL-verified role.
+ * Authenticates Student, Teacher, and Admin accounts using PostgreSQL-verified role.
  */
 async function loginUser(req, res) {
   try {
@@ -213,10 +214,10 @@ async function loginUser(req, res) {
       });
     }
 
-    const [rows] = await pool.query(
+    const { rows } = await pool.query(
       `SELECT id, name, email, password_hash, role, student_id, employee_id, faculty_id, department, semester, section, status, created_at
        FROM users
-       WHERE email = ?
+       WHERE email = $1
        LIMIT 1`,
       [cleanEmail]
     );

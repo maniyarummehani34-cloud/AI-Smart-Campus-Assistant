@@ -1,5 +1,4 @@
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api';
+import { getApiBaseUrl } from '../config/apiConfig';
 
 async function apiRequest(endpoint, { method = 'GET', body, token } = {}) {
   const headers = {
@@ -12,7 +11,7 @@ async function apiRequest(endpoint, { method = 'GET', body, token } = {}) {
 
   let response;
   try {
-    response = await fetch(`${API_BASE_URL}${endpoint}`, {
+    response = await fetch(`${getApiBaseUrl()}${endpoint}`, {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,

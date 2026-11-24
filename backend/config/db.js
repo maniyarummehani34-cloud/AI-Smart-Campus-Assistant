@@ -1,37 +1,42 @@
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
-const mysql = require('mysql2/promise');
+const { Pool, types } = require('pg');
 
-// Ensure backend/.env is loaded in local development (cloud hosts inject env vars directly)
+// Load backend/.env safely using an absolute path relative to this file
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const requiredEnvVars = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_NAME'];
-const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
+// Preserve PostgreSQL DATE (OID 1082) as verbatim 'YYYY-MM-DD' strings
+// to avoid JavaScript Date UTC/local timezone shifts.
+types.setTypeParser(1082, (val) => val);
 
-if (missingEnvVars.length > 0) {
-  console.warn(
-    `MySQL configuration warning: missing environment variable(s): ${missingEnvVars.join(', ')}`
-  );
+if (!process.env.DATABASE_URL) {
+  const requiredPgVars = ['PG_USER', 'PG_DATABASE'];
+  const missingPgVars = requiredPgVars.filter((name) => !process.env[name]);
+  if (missingPgVars.length > 0) {
+    console.warn(
+      `PostgreSQL configuration warning: missing environment variable(s): ${missingPgVars.join(', ')}`
+    );
+  }
 }
 
 /**
- * Builds optional SSL/TLS configuration for managed cloud MySQL hosts (e.g., Aiven).
- * Disabled by default for local XAMPP development when DB_SSL is not "true".
+ * Builds optional SSL/TLS configuration for managed/cloud PostgreSQL hosts.
+ * Disabled by default for local PostgreSQL when PG_SSL is not "true".
  */
 function buildSslConfig() {
-  if (String(process.env.DB_SSL || '').toLowerCase() !== 'true') {
+  if (String(process.env.PG_SSL || '').toLowerCase() !== 'true') {
     return undefined;
   }
 
   const rejectUnauthorized =
-    String(process.env.DB_SSL_REJECT_UNAUTHORIZED || 'true').toLowerCase() !==
+    String(process.env.PG_SSL_REJECT_UNAUTHORIZED || 'true').toLowerCase() !==
     'false';
 
   const sslConfig = { rejectUnauthorized };
 
-  if (process.env.DB_SSL_CA) {
-    const rawCa = process.env.DB_SSL_CA.trim();
+  if (process.env.PG_SSL_CA) {
+    const rawCa = process.env.PG_SSL_CA.trim();
     if (rawCa.includes('BEGIN CERTIFICATE')) {
       sslConfig.ca = rawCa.replace(/\\n/g, '\n');
     } else if (fs.existsSync(rawCa)) {
@@ -42,28 +47,42 @@ function buildSslConfig() {
   return sslConfig;
 }
 
-// Create a reusable MySQL connection pool using environment variables only
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD ?? '',
-  database: process.env.DB_NAME,
-  ssl: buildSslConfig(),
-  waitForConnections: true,
-  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT) || 10,
-  queueLimit: 0,
-  enableKeepAlive: true,
-  keepAliveInitialDelay: 0,
+const poolConfig = process.env.DATABASE_URL
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      ssl: buildSslConfig(),
+      max: Number(process.env.PG_POOL_MAX || process.env.DB_CONNECTION_LIMIT) || 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    }
+  : {
+      host: process.env.PG_HOST || 'localhost',
+      port: process.env.PG_PORT ? Number(process.env.PG_PORT) : 5432,
+      user: process.env.PG_USER,
+      password: process.env.PG_PASSWORD ?? '',
+      database: process.env.PG_DATABASE,
+      ssl: buildSslConfig(),
+      max: Number(process.env.PG_POOL_MAX || process.env.DB_CONNECTION_LIMIT) || 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    };
+
+// Create a reusable PostgreSQL connection pool using environment variables only
+const pool = new Pool(poolConfig);
+
+pool.on('error', (err) => {
+  console.error(
+    `PostgreSQL pool client error (${err && err.code ? err.code : 'PG_POOL_ERROR'})`
+  );
 });
 
 /**
- * Verifies database connectivity using a lightweight SELECT 1 query.
+ * Verifies PostgreSQL connectivity using a lightweight SELECT 1 query.
  * @returns {Promise<boolean>}
  */
 async function checkDatabaseHealth() {
-  const [rows] = await pool.query('SELECT 1 AS connected');
-  return rows.length > 0 && rows[0].connected === 1;
+  const { rows } = await pool.query('SELECT 1 AS connected');
+  return rows.length > 0 && Number(rows[0].connected) === 1;
 }
 
 module.exports = {

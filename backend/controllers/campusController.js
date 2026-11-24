@@ -91,28 +91,44 @@ function sanitizeProfile(user) {
  */
 async function getPublicHighlights(req, res) {
   try {
-    const [[notices], [events], [deptCount], [facCount], [facilCount]] =
-      await Promise.all([
-        pool.query(
-          `SELECT id, title, description, category, target_department, priority, published_date, is_demo
-           FROM notices
-           WHERE status = 'published'
-           ORDER BY FIELD(priority, 'urgent', 'important', 'normal'), published_date DESC
-           LIMIT 4`
-        ),
-        pool.query(
-          `SELECT id, title, description, category, target_department, semester_eligibility,
-                  event_date, event_time, venue, organizer, registration_details, image_url,
-                  registration_link, is_demo
-           FROM events
-           WHERE status = 'published' AND event_date >= CURDATE()
-           ORDER BY event_date ASC, event_time ASC
-           LIMIT 6`
-        ),
-        pool.query("SELECT COUNT(*) AS total FROM departments WHERE status = 'active'"),
-        pool.query('SELECT COUNT(*) AS total FROM faculty'),
-        pool.query("SELECT COUNT(*) AS total FROM facilities WHERE status = 'open'"),
-      ]);
+    const [
+      { rows: notices },
+      { rows: events },
+      { rows: deptCount },
+      { rows: facCount },
+      { rows: facilCount },
+    ] = await Promise.all([
+      pool.query(
+        `SELECT id, title, description, category, target_department, priority, published_date, is_demo
+         FROM notices
+         WHERE status = 'published'
+         ORDER BY
+           CASE priority
+             WHEN 'urgent' THEN 1
+             WHEN 'important' THEN 2
+             WHEN 'normal' THEN 3
+             ELSE 4
+           END,
+           published_date DESC
+         LIMIT 4`
+      ),
+      pool.query(
+        `SELECT id, title, description, category, target_department, semester_eligibility,
+                event_date, event_time, venue, organizer, registration_details, image_url,
+                registration_link, is_demo
+         FROM events
+         WHERE status = 'published' AND event_date >= CURRENT_DATE
+         ORDER BY event_date ASC, event_time ASC
+         LIMIT 6`
+      ),
+      pool.query(
+        "SELECT COUNT(*)::int AS total FROM departments WHERE status = 'active'"
+      ),
+      pool.query('SELECT COUNT(*)::int AS total FROM faculty'),
+      pool.query(
+        "SELECT COUNT(*)::int AS total FROM facilities WHERE status = 'open'"
+      ),
+    ]);
 
     return res.status(200).json({
       notices,
@@ -153,21 +169,24 @@ async function getNotices(req, res) {
 
     const conditions = ["n.status = 'published'"];
     const params = [];
+    const addParam = (val) => {
+      params.push(val);
+      return `$${params.length}`;
+    };
 
     if (req.user.role === 'student') {
       if (req.user.department) {
+        const deptParam = addParam(req.user.department);
         conditions.push(
-          "(LOWER(n.target_department) = 'all' OR LOWER(n.target_department) = LOWER(?))"
+          `(LOWER(n.target_department) = 'all' OR LOWER(n.target_department) = LOWER(${deptParam}))`
         );
-        params.push(req.user.department);
       } else {
         conditions.push("LOWER(n.target_department) = 'all'");
       }
     }
 
     if (rawCategory && rawCategory !== 'all') {
-      conditions.push('n.category = ?');
-      params.push(rawCategory);
+      conditions.push(`n.category = ${addParam(rawCategory)}`);
     }
 
     const sql = `
@@ -179,12 +198,17 @@ async function getNotices(req, res) {
       LEFT JOIN users u ON n.posted_by = u.id
       WHERE ${conditions.join(' AND ')}
       ORDER BY
-        FIELD(n.priority, 'urgent', 'important', 'normal'),
+        CASE n.priority
+          WHEN 'urgent' THEN 1
+          WHEN 'important' THEN 2
+          WHEN 'normal' THEN 3
+          ELSE 4
+        END,
         n.published_date DESC,
         n.id DESC
     `;
 
-    const [rows] = await pool.query(sql, params);
+    const { rows } = await pool.query(sql, params);
     return res.status(200).json({ notices: rows, count: rows.length });
   } catch (error) {
     console.error(`GET /api/notices failed (${error.code || 'UNKNOWN'})`);
@@ -234,31 +258,33 @@ async function getEvents(req, res) {
 
     const conditions = ["e.status = 'published'"];
     const params = [];
+    const addParam = (val) => {
+      params.push(val);
+      return `$${params.length}`;
+    };
 
     if (rawFilter === 'upcoming') {
-      conditions.push('e.event_date >= CURDATE()');
+      conditions.push('e.event_date >= CURRENT_DATE');
     } else if (rawFilter === 'past') {
-      conditions.push('e.event_date < CURDATE()');
+      conditions.push('e.event_date < CURRENT_DATE');
     }
 
     if (rawCategory && rawCategory !== 'all') {
-      conditions.push('e.category = ?');
-      params.push(rawCategory);
+      conditions.push(`e.category = ${addParam(rawCategory)}`);
     }
 
     if (rawDept && rawDept.toLowerCase() !== 'all') {
+      const deptParam = addParam(rawDept);
       conditions.push(
-        "(LOWER(e.target_department) = 'all' OR LOWER(e.target_department) = LOWER(?))"
+        `(LOWER(e.target_department) = 'all' OR LOWER(e.target_department) = LOWER(${deptParam}))`
       );
-      params.push(rawDept);
     }
 
     if (rawSearch) {
-      const like = `%${rawSearch}%`;
+      const likeParam = addParam(`%${rawSearch}%`);
       conditions.push(
-        '(e.title LIKE ? OR e.description LIKE ? OR e.venue LIKE ? OR e.organizer LIKE ?)'
+        `(e.title ILIKE ${likeParam} OR e.description ILIKE ${likeParam} OR e.venue ILIKE ${likeParam} OR e.organizer ILIKE ${likeParam})`
       );
-      params.push(like, like, like, like);
     }
 
     const orderClause =
@@ -279,7 +305,7 @@ async function getEvents(req, res) {
       ${orderClause}
     `;
 
-    const [rows] = await pool.query(sql, params);
+    const { rows } = await pool.query(sql, params);
 
     return res.status(200).json({
       events: rows,
@@ -318,6 +344,10 @@ async function getTimetable(req, res) {
 
     const conditions = ["t.status = 'published'"];
     const params = [];
+    const addParam = (val) => {
+      params.push(val);
+      return `$${params.length}`;
+    };
 
     if (req.user.role === 'student') {
       if (!req.user.department || !req.user.semester) {
@@ -332,19 +362,13 @@ async function getTimetable(req, res) {
         });
       }
 
-      conditions.push('LOWER(t.department) = LOWER(?)');
-      params.push(req.user.department);
-
-      conditions.push('t.semester = ?');
-      params.push(req.user.semester);
-
-      conditions.push('UPPER(t.section) = UPPER(?)');
-      params.push(req.user.section || 'A');
+      conditions.push(`LOWER(t.department) = LOWER(${addParam(req.user.department)})`);
+      conditions.push(`t.semester = ${addParam(req.user.semester)}`);
+      conditions.push(`UPPER(t.section) = UPPER(${addParam(req.user.section || 'A')})`);
     }
 
     if (matchedDay) {
-      conditions.push('t.day_of_week = ?');
-      params.push(matchedDay);
+      conditions.push(`t.day_of_week = ${addParam(matchedDay)}`);
     }
 
     const sql = `
@@ -357,12 +381,20 @@ async function getTimetable(req, res) {
       LEFT JOIN faculty f ON t.faculty_id = f.id
       WHERE ${conditions.join(' AND ')}
       ORDER BY
-        FIELD(t.day_of_week, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'),
+        CASE t.day_of_week
+          WHEN 'Monday' THEN 1
+          WHEN 'Tuesday' THEN 2
+          WHEN 'Wednesday' THEN 3
+          WHEN 'Thursday' THEN 4
+          WHEN 'Friday' THEN 5
+          WHEN 'Saturday' THEN 6
+          ELSE 7
+        END,
         t.start_time ASC,
         t.section ASC
     `;
 
-    const [rows] = await pool.query(sql, params);
+    const { rows } = await pool.query(sql, params);
 
     return res.status(200).json({
       timetable: rows,
@@ -395,24 +427,26 @@ async function getFaculty(req, res) {
 
     const conditions = [];
     const params = [];
+    const addParam = (val) => {
+      params.push(val);
+      return `$${params.length}`;
+    };
 
     if (rawDepartment && rawDepartment.toLowerCase() !== 'all') {
-      conditions.push('LOWER(department) = LOWER(?)');
-      params.push(rawDepartment);
+      conditions.push(`LOWER(department) = LOWER(${addParam(rawDepartment)})`);
     }
 
     if (rawSearch) {
-      const likeTerm = `%${rawSearch}%`;
+      const likeParam = addParam(`%${rawSearch}%`);
       conditions.push(
-        '(name LIKE ? OR department LIKE ? OR designation LIKE ? OR office_location LIKE ?)'
+        `(name ILIKE ${likeParam} OR department ILIKE ${likeParam} OR designation ILIKE ${likeParam} OR office_location ILIKE ${likeParam})`
       );
-      params.push(likeTerm, likeTerm, likeTerm, likeTerm);
     }
 
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const [rows] = await pool.query(
+    const { rows } = await pool.query(
       `SELECT id, name, department, designation, email, phone, office_location, consultation_hours, is_demo
        FROM faculty
        ${whereClause}
@@ -461,24 +495,33 @@ async function getFacilities(req, res) {
 
     const conditions = [];
     const params = [];
+    const addParam = (val) => {
+      params.push(val);
+      return `$${params.length}`;
+    };
 
     if (rawCategory && rawCategory !== 'all') {
-      conditions.push('category = ?');
-      params.push(rawCategory);
+      conditions.push(`category = ${addParam(rawCategory)}`);
     }
     if (rawStatus && rawStatus !== 'all') {
-      conditions.push('status = ?');
-      params.push(rawStatus);
+      conditions.push(`status = ${addParam(rawStatus)}`);
     }
 
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const [rows] = await pool.query(
+    const { rows } = await pool.query(
       `SELECT id, name, category, description, location, opening_hours, contact_info, status, is_demo
        FROM facilities
        ${whereClause}
-       ORDER BY FIELD(status, 'open', 'maintenance', 'closed'), name ASC`,
+       ORDER BY
+         CASE status
+           WHEN 'open' THEN 1
+           WHEN 'maintenance' THEN 2
+           WHEN 'closed' THEN 3
+           ELSE 4
+         END,
+         name ASC`,
       params
     );
 
@@ -514,9 +557,9 @@ async function getStudentExams(req, res) {
     const conditions = [
       "e.status = 'published'",
       "es.status = 'published'",
-      'LOWER(e.department) = LOWER(?)',
-      'e.semester = ?',
-      'UPPER(e.section) = UPPER(?)',
+      'LOWER(e.department) = LOWER($1)',
+      'e.semester = $2',
+      'UPPER(e.section) = UPPER($3)',
     ];
     const params = [
       req.user.department,
@@ -525,11 +568,11 @@ async function getStudentExams(req, res) {
     ];
 
     if (rawType && rawType !== 'all') {
-      conditions.push('e.exam_type = ?');
       params.push(rawType);
+      conditions.push(`e.exam_type = $${params.length}`);
     }
 
-    const [rows] = await pool.query(
+    const { rows } = await pool.query(
       `SELECT
          es.id AS exam_subject_id,
          e.id AS exam_id,
@@ -581,7 +624,7 @@ async function getStudentResults(req, res) {
   try {
     const studentUserId = req.user.id;
 
-    const [resultsRows] = await pool.query(
+    const { rows: resultsRows } = await pool.query(
       `SELECT
          r.id AS result_id,
          r.exam_id,
@@ -599,7 +642,7 @@ async function getStudentResults(req, res) {
          e.academic_year
        FROM results r
        INNER JOIN exams e ON r.exam_id = e.id
-       WHERE r.student_id = ? AND r.publish_status = 'published'
+       WHERE r.student_id = $1 AND r.publish_status = 'published'
        ORDER BY r.published_at DESC, r.id DESC`,
       [studentUserId]
     );
@@ -612,25 +655,32 @@ async function getStudentResults(req, res) {
       });
     }
 
-    const examIds = resultsRows.map((r) => r.exam_id);
-    const [markRows] = await pool.query(
-      `SELECT
-         es.exam_id,
-         s.code AS subject_code,
-         s.name AS subject_name,
-         m.obtained_marks,
-         m.max_marks,
-         es.passing_marks,
-         m.remarks
-       FROM marks m
-       INNER JOIN exam_subjects es ON m.exam_subject_id = es.id
-       INNER JOIN subjects s ON m.subject_id = s.id
-       WHERE m.student_id = ?
-         AND m.submission_status = 'approved'
-         AND es.exam_id IN (?)
-       ORDER BY s.code ASC`,
-      [studentUserId, examIds]
-    );
+    const examIds = resultsRows
+      .map((r) => Number(r.exam_id))
+      .filter((id) => Number.isInteger(id));
+
+    let markRows = [];
+    if (examIds.length > 0) {
+      const marksResult = await pool.query(
+        `SELECT
+           es.exam_id,
+           s.code AS subject_code,
+           s.name AS subject_name,
+           m.obtained_marks,
+           m.max_marks,
+           es.passing_marks,
+           m.remarks
+         FROM marks m
+         INNER JOIN exam_subjects es ON m.exam_subject_id = es.id
+         INNER JOIN subjects s ON m.subject_id = s.id
+         WHERE m.student_id = $1
+           AND m.submission_status = 'approved'
+           AND es.exam_id = ANY($2::int[])
+         ORDER BY s.code ASC`,
+        [studentUserId, examIds]
+      );
+      markRows = marksResult.rows;
+    }
 
     const marksByExam = new Map();
     for (const row of markRows) {
@@ -671,25 +721,25 @@ async function getStudentDashboard(req, res) {
     const studentSection = student.section || 'A';
 
     const noticeWhere = student.department
-      ? "n.status = 'published' AND (LOWER(n.target_department) = 'all' OR LOWER(n.target_department) = LOWER(?))"
+      ? "n.status = 'published' AND (LOWER(n.target_department) = 'all' OR LOWER(n.target_department) = LOWER($1))"
       : "n.status = 'published' AND LOWER(n.target_department) = 'all'";
     const noticeParams = student.department ? [student.department] : [];
 
     const hasAcademicScope = Boolean(student.department && student.semester);
 
     const [
-      [noticeCountRows],
-      [latestNotices],
-      [eventCountRows],
-      [upcomingEvents],
-      [timetableRows],
-      [facilitySummaryRows],
-      [facultyCountRows],
-      [upcomingExams],
-      [recentResults],
+      { rows: noticeCountRows },
+      { rows: latestNotices },
+      { rows: eventCountRows },
+      { rows: upcomingEvents },
+      { rows: timetableRows },
+      { rows: facilitySummaryRows },
+      { rows: facultyCountRows },
+      { rows: upcomingExams },
+      { rows: recentResults },
     ] = await Promise.all([
       pool.query(
-        `SELECT COUNT(*) AS total FROM notices n WHERE ${noticeWhere}`,
+        `SELECT COUNT(*)::int AS total FROM notices n WHERE ${noticeWhere}`,
         noticeParams
       ),
       pool.query(
@@ -699,12 +749,20 @@ async function getStudentDashboard(req, res) {
          FROM notices n
          LEFT JOIN users u ON n.posted_by = u.id
          WHERE ${noticeWhere}
-         ORDER BY FIELD(n.priority, 'urgent', 'important', 'normal'), n.published_date DESC, n.id DESC
+         ORDER BY
+           CASE n.priority
+             WHEN 'urgent' THEN 1
+             WHEN 'important' THEN 2
+             WHEN 'normal' THEN 3
+             ELSE 4
+           END,
+           n.published_date DESC,
+           n.id DESC
          LIMIT 5`,
         noticeParams
       ),
       pool.query(
-        "SELECT COUNT(*) AS total FROM events WHERE status = 'published' AND event_date >= CURDATE()"
+        "SELECT COUNT(*)::int AS total FROM events WHERE status = 'published' AND event_date >= CURRENT_DATE"
       ),
       pool.query(
         `SELECT
@@ -712,7 +770,7 @@ async function getStudentDashboard(req, res) {
            event_date, event_time, venue, organizer, registration_details, image_url,
            registration_link, is_demo
          FROM events
-         WHERE status = 'published' AND event_date >= CURDATE()
+         WHERE status = 'published' AND event_date >= CURRENT_DATE
          ORDER BY event_date ASC, event_time ASC, id ASC
          LIMIT 5`
       ),
@@ -725,22 +783,30 @@ async function getStudentDashboard(req, res) {
              FROM timetable t
              LEFT JOIN faculty f ON t.faculty_id = f.id
              WHERE t.status = 'published'
-               AND LOWER(t.department) = LOWER(?)
-               AND t.semester = ?
-               AND UPPER(t.section) = UPPER(?)
+               AND LOWER(t.department) = LOWER($1)
+               AND t.semester = $2
+               AND UPPER(t.section) = UPPER($3)
              ORDER BY
-               FIELD(t.day_of_week, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'),
+               CASE t.day_of_week
+                 WHEN 'Monday' THEN 1
+                 WHEN 'Tuesday' THEN 2
+                 WHEN 'Wednesday' THEN 3
+                 WHEN 'Thursday' THEN 4
+                 WHEN 'Friday' THEN 5
+                 WHEN 'Saturday' THEN 6
+                 ELSE 7
+               END,
                t.start_time ASC`,
             [student.department, student.semester, studentSection]
           )
-        : Promise.resolve([[]]),
+        : Promise.resolve({ rows: [] }),
       pool.query(
         `SELECT
-           COUNT(*) AS total,
-           SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count
+           COUNT(*)::int AS total,
+           COALESCE(SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END), 0)::int AS open_count
          FROM facilities`
       ),
-      pool.query('SELECT COUNT(*) AS total FROM faculty'),
+      pool.query('SELECT COUNT(*)::int AS total FROM faculty'),
       hasAcademicScope
         ? pool.query(
             `SELECT
@@ -752,14 +818,14 @@ async function getStudentDashboard(req, res) {
              INNER JOIN subjects s ON es.subject_id = s.id
              WHERE e.status = 'published'
                AND es.status = 'published'
-               AND LOWER(e.department) = LOWER(?)
-               AND e.semester = ?
-               AND UPPER(e.section) = UPPER(?)
+               AND LOWER(e.department) = LOWER($1)
+               AND e.semester = $2
+               AND UPPER(e.section) = UPPER($3)
              ORDER BY es.exam_date ASC, es.start_time ASC
              LIMIT 6`,
             [student.department, student.semester, studentSection]
           )
-        : Promise.resolve([[]]),
+        : Promise.resolve({ rows: [] }),
       pool.query(
         `SELECT
            r.id AS result_id, r.exam_id, r.total_obtained, r.total_max,
@@ -767,7 +833,7 @@ async function getStudentDashboard(req, res) {
            e.title AS exam_title, e.exam_type
          FROM results r
          INNER JOIN exams e ON r.exam_id = e.id
-         WHERE r.student_id = ? AND r.publish_status = 'published'
+         WHERE r.student_id = $1 AND r.publish_status = 'published'
          ORDER BY r.published_at DESC
          LIMIT 5`,
         [student.id]
