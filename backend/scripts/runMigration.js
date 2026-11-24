@@ -11,6 +11,29 @@ const mysql = require('mysql2/promise');
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
+function buildSslConfig() {
+  if (String(process.env.DB_SSL || '').toLowerCase() !== 'true') {
+    return undefined;
+  }
+
+  const rejectUnauthorized =
+    String(process.env.DB_SSL_REJECT_UNAUTHORIZED || 'true').toLowerCase() !==
+    'false';
+
+  const sslConfig = { rejectUnauthorized };
+
+  if (process.env.DB_SSL_CA) {
+    const rawCa = process.env.DB_SSL_CA.trim();
+    if (rawCa.includes('BEGIN CERTIFICATE')) {
+      sslConfig.ca = rawCa.replace(/\\n/g, '\n');
+    } else if (fs.existsSync(rawCa)) {
+      sslConfig.ca = fs.readFileSync(rawCa, 'utf8');
+    }
+  }
+
+  return sslConfig;
+}
+
 async function runMigration() {
   const migrationPath = path.join(
     __dirname,
@@ -29,6 +52,7 @@ async function runMigration() {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD ?? '',
     database: process.env.DB_NAME,
+    ssl: buildSslConfig(),
     multipleStatements: true,
   });
 
